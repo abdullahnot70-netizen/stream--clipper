@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""
+Free live-stream auto-clipper (Twitch). Saves a clip when chat activity spikes.
+
+Setup:   pip install streamlink      and install ffmpeg
+Run:     python clipper.py CHANNELNAME
+No login, no API keys, no paid services.
+
+How it works:
+  1. Streamlink + FFmpeg record the live stream into a rolling buffer of
+     small .ts segments (stream copy, so almost no CPU).
+  2. Chat is read anonymously over Twitch IRC. Messages per WINDOW seconds
+     are compared with the channel's normal rate.
+  3. On a spike, the last PRE seconds plus the next POST seconds are stitched
+     into an MP4 in the clips/ folder.
+"""
+import collections
+import glob
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+CHANNEL = (sys.argv[1] if len(sys.argv) > 1 else "").lower().lstrip("#")
+QUALITY = "480p,worst"   # low quality = less bandwidth/CPU on free servers
+PRE, POST = 30, 15       # seconds kept before / after the spike
+SEG = 4                  # segment length in seconds
+KEEP = 150               # seconds of buffer kept on disk
+WINDOW = 10              # seconds used to measure chat rate
+MULT = 3.0               # spike = rate >= MULT x normal rate
+MIN_MSGS = 15            # ...and at least this many msgs in WINDOW
+COOLDOWN = 60            # minimum seconds between clips
+WARMUP = 60              # learn the normal rate before clipping
+BUF, OUT = "buffer", "clips"
+
+msgs = collections.deque()
+lock = threading.Lock()
+
+
+def on_msg():
+    with lock:
+        msgs.append(time.time())
+
+
+def recorder():
+    """Record the live stream into rolling .ts segments."""
+    while True:
+        sl = subprocess.Popen(
+            ["streamlink", "--stdout", f"twitch.tv/{CHANNEL}", QUALITY],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ff = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-c", "copy",
+             "-f", "segment", "-segment_time", str(SEG),
+             "-segment_format", "mpegts", "-strftime", "1",
+             f"{BUF}/%Y%m%d-%H%M%S.ts"],
+            stdin=sl.stdout)
+        sl.stdout.close()
+        ff.wait()
+        sl.kill()
+        print("stream offline or dropped, retrying in 10s...")
+        time.sleep(10)
+
+
+def cleaner():
+    """Delete buffer segments older than KEEP seconds."""
+    while True:
+        for f in glob.glob(f"{BUF}/*.ts"):
+            try:
+                if time.time() - os.path.getmtime(f) > KEEP:
+                    os.remove(f)
+            except OSError:
+                pass
+        time.sleep(10)
+
+
+def chat():
+    """Count chat messages (anonymous read-only Twitch IRC)."""
+    while True:
+        try:
+            s = socket.create_connection(("irc.chat.twitch.tv", 6667), timeout=300)
+            s.sendall(
+                f"PASS SCHMOOPIIE\r\nNICK justinfan{int(time.time()) % 99999}\r\n"
+                f"JOIN #{CHANNEL}\r\n".encode())
+            pending = ""
+            while True:
+                data = s.recv(4096).decode("utf-8", "ignore")
+                if not data:
+                    break
+                pending += data
+                *lines, pending = pending.split("\r\n")
+                for line in lines:
+                    if line.startswith("PING"):
+                        s.sendall(b"PONG :tmi.twitch.tv\r\n")
+                    elif "PRIVMSG" in line:
+                        on_msg()
+        except Exception as e:
+            print("chat error:", e)
+        time.sleep(5)
+
+
+def make_clip(t):
+    """Wait for the aftermath, then stitch segments around time t."""
+    time.sleep(POST + SEG + 1)
+    segs = []
+    for f in glob.glob(f"{BUF}/*.ts"):
+        try:
+            segs.append((os.path.getmtime(f), f))
+        except OSError:
+            pass
+    pick = [f for m, f in sorted(segs) if t - PRE <= m <= t + POST + SEG]
+    if not pick:
+        print("no segments found for clip")
+        return
+    lst = f"{BUF}/list_{int(t)}.txt"
+    with open(lst, "w") as fh:
+        for f in pick:
+            fh.write(f"file '{os.path.abspath(f)}'\n")
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(t))
+    out = f"{OUT}/{CHANNEL}_{stamp}.mp4"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "concat",
+                    "-safe", "0", "-i", lst, "-c", "copy", out])
+    os.remove(lst)
+    print("saved", out)
+
+
+def main():
+    if not CHANNEL:
+        sys.exit("Usage: python clipper.py CHANNELNAME")
+    os.makedirs(BUF, exist_ok=True)
+    os.makedirs(OUT, exist_ok=True)
+    for fn in (recorder, cleaner, chat):
+        threading.Thread(target=fn, daemon=True).start()
+
+    start, last, base = time.time(), 0, None
+    print(f"Watching #{CHANNEL}... Ctrl+C to stop")
+    while True:
+        time.sleep(1)
+        now = time.time()
+        with lock:
+            while msgs and msgs[0] < now - WINDOW:
+                msgs.popleft()
+            rate = len(msgs)
+        if base is None:
+            base = rate
+        spike = (now - start > WARMUP and rate >= MIN_MSGS
+                 and rate >= MULT * max(base, 1) and now - last > COOLDOWN)
+        if spike:
+            last = now
+            print(f"SPIKE: {rate} msgs/{WINDOW}s (normal ~{base:.1f}) -> clipping")
+            threading.Thread(target=make_clip, args=(now,), daemon=True).start()
+        else:
+            base += (rate - base) / 300  # slowly track the normal rate
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
