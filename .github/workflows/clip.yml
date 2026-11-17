@@ -1,0 +1,30 @@
+name: Clip stream
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Twitch channel name
+        required: true
+      minutes:
+        description: Minutes to watch (max 340)
+        default: "300"
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install streamlink
+          sudo apt-get install -y ffmpeg
+      - run: timeout ${{ inputs.minutes }}m python clipper.py "$CHANNEL" || true
+        env:
+          CHANNEL: ${{ inputs.channel }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clips
+          path: clips/*.mp4
